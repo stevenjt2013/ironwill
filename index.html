@@ -9,6 +9,7 @@
 <!-- Firebase SDK -->
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 
 <style>
   :root {
@@ -2030,8 +2031,73 @@ const firebaseConfig = {
 
 firebase.initializeApp(firebaseConfig);
 const auth = firebase.auth();
+const db = firebase.firestore();
 
 let currentUser = null;
+let firestoreReady = false;
+
+// ====================== FIRESTORE SYNC ======================
+function getUserDocRef() {
+  if(!currentUser) return null;
+  return db.collection('users').doc(currentUser.uid);
+}
+
+// Load all user data from Firestore
+function loadFromFirestore() {
+  const docRef = getUserDocRef();
+  if(!docRef) return Promise.resolve(false);
+
+  return docRef.get().then(function(doc) {
+    if(doc.exists) {
+      const data = doc.data();
+      workouts = data.workouts || [];
+      sessions = data.sessions || [];
+      profile = data.profile || {};
+      measurements = data.measurements || [];
+      planner = data.planner || {};
+
+      // Also update localStorage as offline cache
+      localStorage.setItem('ironwill_workouts', JSON.stringify(workouts));
+      localStorage.setItem('ironwill_sessions', JSON.stringify(sessions));
+      localStorage.setItem('ironwill_profile', JSON.stringify(profile));
+      localStorage.setItem('ironwill_measurements', JSON.stringify(measurements));
+      localStorage.setItem('ironwill_planner', JSON.stringify(planner));
+
+      return true; // cloud data found
+    }
+    return false; // no cloud data yet
+  }).catch(function(err) {
+    console.error('Firestore load error:', err);
+    return false;
+  });
+}
+
+// Save all user data to Firestore
+function saveToFirestore() {
+  const docRef = getUserDocRef();
+  if(!docRef || !firestoreReady) return Promise.resolve();
+
+  return docRef.set({
+    workouts: workouts,
+    sessions: sessions,
+    profile: profile,
+    measurements: measurements,
+    planner: planner,
+    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+  }, { merge: true }).catch(function(err) {
+    console.error('Firestore save error:', err);
+  });
+}
+
+// Migrate localStorage data up to Firestore for first-time cloud users
+function migrateLocalToFirestore() {
+  const hasLocal = workouts.length || sessions.length || Object.keys(profile).length ||
+                   measurements.length || Object.keys(planner).length;
+  if(hasLocal) {
+    return saveToFirestore();
+  }
+  return Promise.resolve();
+}
 
 // ====================== AUTH FUNCTIONS ======================
 function signInWithGoogle() {
@@ -2077,6 +2143,7 @@ function signOutUser() {
   if(!confirm('Sign out of IronWill?')) return;
   auth.signOut().then(function() {
     currentUser = null;
+    firestoreReady = false;
     document.getElementById('auth-gate').classList.remove('hidden');
     showToast('Signed out', 'success');
   });
@@ -2104,7 +2171,6 @@ function onAuthReady(user) {
 
     if(user.photoURL) {
       avatarEl.innerHTML = '<img src="' + user.photoURL + '" alt="avatar">';
-      // Top bar avatar
       document.getElementById('top-bar-avatar').style.display = 'block';
       document.getElementById('top-bar-avatar-img').src = user.photoURL;
     } else {
@@ -2112,9 +2178,17 @@ function onAuthReady(user) {
       document.getElementById('top-bar-avatar').style.display = 'none';
     }
 
-    // Initialize the app
-    renderDashboard();
-    renderHome();
+    // Load data from Firestore, fall back to localStorage
+    loadFromFirestore().then(function(cloudDataFound) {
+      firestoreReady = true;
+      if(!cloudDataFound) {
+        // First time signing in — push any existing localStorage data to cloud
+        migrateLocalToFirestore();
+      }
+      renderDashboard();
+      renderHome();
+    });
+
   } else {
     // Show login screen
     gate.classList.remove('hidden');
@@ -2141,11 +2215,15 @@ function toLocalISO(d) {
 }
 
 function saveData() {
+  // Always save to localStorage (offline cache)
   localStorage.setItem('ironwill_workouts', JSON.stringify(workouts));
   localStorage.setItem('ironwill_sessions', JSON.stringify(sessions));
   localStorage.setItem('ironwill_profile', JSON.stringify(profile));
   localStorage.setItem('ironwill_measurements', JSON.stringify(measurements));
   localStorage.setItem('ironwill_planner', JSON.stringify(planner));
+
+  // Also save to Firestore (cloud sync)
+  saveToFirestore();
 }
 
 let currentWorkoutId = null;
