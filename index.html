@@ -10,6 +10,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-functions-compat.js"></script>
 
 <style>
   :root {
@@ -1768,6 +1769,21 @@
       <button class="btn btn-secondary btn-sm" onclick="signOutUser()">Sign Out</button>
     </div>
 
+    <!-- Subscription Plan -->
+    <div class="card" id="plan-card" style="margin-bottom:24px;display:none;">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
+        <div>
+          <h3 style="font-family:'Bebas Neue',sans-serif;font-size:20px;letter-spacing:2px;" id="plan-title">FREE PLAN</h3>
+          <p style="color:var(--text3);font-size:13px;" id="plan-desc">5 workout uploads included</p>
+        </div>
+        <button class="btn btn-primary" id="upgrade-btn" onclick="startCheckout()">⚡ Upgrade to Pro — $3/mo</button>
+      </div>
+      <div style="margin-top:12px;background:var(--surface2);border-radius:6px;overflow:hidden;height:6px;">
+        <div id="plan-usage-bar" style="height:100%;background:var(--accent);border-radius:6px;transition:width 0.4s;"></div>
+      </div>
+      <p style="font-size:11px;color:var(--text3);margin-top:6px;font-family:'DM Mono',monospace;" id="plan-usage-text">0/5 uploads used</p>
+    </div>
+
     <div class="card" style="margin-bottom:24px;">
       <h3 style="font-family:'Bebas Neue',sans-serif;font-size:20px;letter-spacing:2px;margin-bottom:16px;">PERSONAL INFO</h3>
       <div class="profile-grid">
@@ -2032,9 +2048,37 @@ const firebaseConfig = {
 firebase.initializeApp(firebaseConfig);
 const auth = firebase.auth();
 const db = firebase.firestore();
+const functions = firebase.functions();
 
 let currentUser = null;
 let firestoreReady = false;
+
+let userPlan = 'free';
+let uploadCount = 0;
+const FREE_UPLOAD_LIMIT = 5;
+const PRO_UPLOAD_LIMIT = 52;
+
+async function startCheckout() {
+  try {
+    showToast('Opening checkout...', 'success');
+    const createCheckoutSession = functions.httpsCallable('createCheckoutSession');
+    const result = await createCheckoutSession();
+    window.location.href = result.data.url;
+  } catch(err) {
+    console.error('Checkout error:', err);
+    showToast('Checkout failed: ' + err.message, 'error');
+  }
+}
+
+function canUpload() {
+  if(userPlan === 'pro') return uploadCount < PRO_UPLOAD_LIMIT;
+  return uploadCount < FREE_UPLOAD_LIMIT;
+}
+
+function getUploadsRemaining() {
+  const limit = userPlan === 'pro' ? PRO_UPLOAD_LIMIT : FREE_UPLOAD_LIMIT;
+  return Math.max(0, limit - uploadCount);
+}
 
 // ====================== FIRESTORE SYNC ======================
 function getUserDocRef() {
@@ -2055,6 +2099,8 @@ function loadFromFirestore() {
       profile = data.profile || {};
       measurements = data.measurements || [];
       planner = data.planner || {};
+      userPlan = data.plan || 'free';
+      uploadCount = data.uploadCount || 0;
 
       // Also update localStorage as offline cache
       localStorage.setItem('ironwill_workouts', JSON.stringify(workouts));
@@ -2083,6 +2129,7 @@ function saveToFirestore() {
     profile: profile,
     measurements: measurements,
     planner: planner,
+    uploadCount: uploadCount,
     updatedAt: firebase.firestore.FieldValue.serverTimestamp()
   }, { merge: true }).catch(function(err) {
     console.error('Firestore save error:', err);
@@ -2198,6 +2245,12 @@ function onAuthReady(user) {
 }
 
 // Listen for auth state changes
+// Handle Stripe redirect
+if(window.location.search.includes('upgrade=success')) {
+  window.history.replaceState({}, '', window.location.pathname);
+  setTimeout(() => showToast('Welcome to IronWill Pro! 🎉', 'success'), 1500);
+}
+
 auth.onAuthStateChanged(onAuthReady);
 
 // ====================== STATE ======================
@@ -3609,6 +3662,17 @@ uploadArea.addEventListener('drop', e => {
 });
 
 async function processUpload() {
+  if(!canUpload()) {
+    closeModal('upload-modal');
+    if(userPlan === 'free') {
+      if(confirm('You\'ve used all ' + FREE_UPLOAD_LIMIT + ' free uploads. Upgrade to IronWill Pro ($3/month) for 52 uploads per year?\n\n30-day free trial included!')) {
+        startCheckout();
+      }
+    } else {
+      showToast('Upload limit reached for this year', 'error');
+    }
+    return;
+  }
   const apiKey = document.getElementById('api-key-input').value.trim();
   const workoutName = document.getElementById('upload-workout-name').value.trim() || 'My Workout';
   const phase = document.getElementById('upload-phase').value.trim() || '';
@@ -3676,6 +3740,7 @@ If the workout does NOT show multiple weeks (only shows one set of sets/reps), s
     };
 
     workouts.push(workout);
+    uploadCount++;
     saveData();
     hideLoading();
     showToast(`${workout.exercises.length} exercises extracted!`, 'success');
@@ -4265,6 +4330,18 @@ function renderHistory() {
 
 // ====================== PROFILE ======================
 function renderProfile() {
+  // Update plan card
+  const planCard = document.getElementById('plan-card');
+  if(planCard) {
+    planCard.style.display = 'block';
+    const limit = userPlan === 'pro' ? PRO_UPLOAD_LIMIT : FREE_UPLOAD_LIMIT;
+    document.getElementById('plan-title').textContent = userPlan === 'pro' ? 'PRO PLAN ⚡' : 'FREE PLAN';
+    document.getElementById('plan-desc').textContent = userPlan === 'pro' ? '52 workout uploads per year' : '5 workout uploads included';
+    document.getElementById('upgrade-btn').style.display = userPlan === 'pro' ? 'none' : 'inline-flex';
+    document.getElementById('plan-usage-bar').style.width = Math.min(100, (uploadCount / limit) * 100) + '%';
+    document.getElementById('plan-usage-text').textContent = uploadCount + '/' + limit + ' uploads used';
+  }
+
   document.getElementById('profile-name').value = profile.name || '';
   document.getElementById('profile-age').value = profile.age || '';
   document.getElementById('profile-height').value = profile.height || '';
